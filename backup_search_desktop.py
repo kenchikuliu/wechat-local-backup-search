@@ -140,6 +140,10 @@ class BackupSearchDesktop(tk.Tk):
         detail_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
         detail_frame.columnconfigure(0, weight=1)
         ttk.Label(detail_frame, text="消息详情", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+        detail_toolbar = ttk.Frame(detail_frame, style="Card.TFrame")
+        detail_toolbar.grid(row=0, column=1, sticky="e")
+        ttk.Button(detail_toolbar, text="复制详情", command=self._copy_detail).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(detail_toolbar, text="复制摘要", command=self._copy_summary).grid(row=0, column=1)
         self.detail_text = tk.Text(detail_frame, height=8, wrap="word", bg="#fffef8", relief="flat")
         self.detail_text.grid(row=1, column=0, sticky="nsew", pady=(5, 0))
 
@@ -376,6 +380,23 @@ class BackupSearchDesktop(tk.Tk):
                 )
         self.summary_text.delete("1.0", "end")
         self.summary_text.insert("1.0", "\n".join(summary_lines) if summary_lines else "暂无会话摘要。")
+
+    def _copy_text(self, text: str) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update_idletasks()
+
+    def _copy_detail(self):
+        text = self.detail_text.get("1.0", "end").strip()
+        if text:
+            self._copy_text(text)
+            messagebox.showinfo("已复制", "消息详情已复制到剪贴板")
+
+    def _copy_summary(self):
+        text = self.summary_text.get("1.0", "end").strip()
+        if text:
+            self._copy_text(text)
+            messagebox.showinfo("已复制", "会话摘要已复制到剪贴板")
 
 
 def main():
