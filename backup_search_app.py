@@ -35,6 +35,15 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from pathlib import Path
 
+from backup_search_knowledge import (
+    ChatAccumulator,
+    chat_identity,
+    compact_text,
+    decode_json_list,
+    related_query_terms,
+    short_snippet,
+)
+
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_DIR = os.environ.get("WECHAT_DECRYPT_APP_DIR", SCRIPT_DIR)
@@ -81,6 +90,7 @@ EXPORT_DIR = os.path.join(DATA_DIR, "exported_chats")
 INDEX_DB = os.path.join(DATA_DIR, "search_index.sqlite3")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 LOG_FILE = os.path.join(DATA_DIR, "backup.log")
+KNOWLEDGE_NEIGHBOR_LIMIT = 6
 
 MIN_INTERVAL_MINUTES = 1
 DEFAULT_SETTINGS = {
@@ -441,6 +451,37 @@ def _init_index_schema(conn: sqlite3.Connection) -> str:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS chat_summaries (
+            chat_key TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            chat TEXT NOT NULL,
+            is_group INTEGER NOT NULL DEFAULT 0,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            text_message_count INTEGER NOT NULL DEFAULT 0,
+            participant_count INTEGER NOT NULL DEFAULT 0,
+            active_days INTEGER NOT NULL DEFAULT 0,
+            first_timestamp INTEGER,
+            last_timestamp INTEGER,
+            top_sender TEXT,
+            top_keywords_json TEXT NOT NULL DEFAULT '[]',
+            top_types_json TEXT NOT NULL DEFAULT '[]',
+            top_senders_json TEXT NOT NULL DEFAULT '[]'
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS keyword_index (
+            chat_key TEXT NOT NULL,
+            term TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            sample TEXT,
+            PRIMARY KEY (chat_key, term)
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -452,6 +493,12 @@ def _init_index_schema(conn: sqlite3.Connection) -> str:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_username ON messages(username)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_keyword_term ON keyword_index(term, count DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chat_summaries_last_ts ON chat_summaries(last_timestamp DESC)"
+    )
 
     tokenizer = conn.execute(
         "SELECT value FROM meta WHERE key='fts_tokenizer'"
@@ -487,14 +534,19 @@ def rebuild_index(export_dir: str = EXPORT_DIR) -> dict:
         "messages": 0,
         "skipped_files": 0,
         "fts_tokenizer": "",
+        "summary_chats": 0,
+        "keyword_rows": 0,
         "elapsed_seconds": 0.0,
     }
+    chat_accumulators: dict[str, ChatAccumulator] = {}
     with closing(_connect_index()) as conn:
         tokenizer = _init_index_schema(conn)
         stats["fts_tokenizer"] = tokenizer
         conn.execute("DELETE FROM messages")
         if tokenizer:
             conn.execute("DELETE FROM messages_fts")
+        conn.execute("DELETE FROM chat_summaries")
+        conn.execute("DELETE FROM keyword_index")
 
         for path in _iter_export_json_files(export_dir) or []:
             stats["files"] += 1
@@ -514,6 +566,11 @@ def rebuild_index(export_dir: str = EXPORT_DIR) -> dict:
             if not isinstance(messages, list):
                 stats["skipped_files"] += 1
                 continue
+            key = chat_identity(username, chat)
+            acc = chat_accumulators.get(key)
+            if acc is None:
+                acc = ChatAccumulator(username=username, chat=chat, is_group=is_group)
+                chat_accumulators[key] = acc
 
             for msg in messages:
                 if not isinstance(msg, dict):
@@ -555,7 +612,7 @@ def rebuild_index(export_dir: str = EXPORT_DIR) -> dict:
                         os.path.basename(path),
                         _safe_json(msg),
                     ),
-                )
+                    )
                 if tokenizer:
                     conn.execute(
                         """
@@ -564,7 +621,52 @@ def rebuild_index(export_dir: str = EXPORT_DIR) -> dict:
                         """,
                         (cur.lastrowid, chat, sender, text, username),
                     )
+                acc.update(
+                    sender=sender,
+                    msg_type=msg_type,
+                    timestamp=timestamp_int,
+                    text=text,
+                )
                 stats["messages"] += 1
+
+        for key, acc in chat_accumulators.items():
+            summary = acc.finalize()
+            conn.execute(
+                """
+                INSERT INTO chat_summaries (
+                    chat_key, username, chat, is_group, message_count,
+                    text_message_count, participant_count, active_days,
+                    first_timestamp, last_timestamp, top_sender,
+                    top_keywords_json, top_types_json, top_senders_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    key,
+                    summary["username"],
+                    summary["chat"],
+                    summary["is_group"],
+                    summary["message_count"],
+                    summary["text_message_count"],
+                    summary["participant_count"],
+                    summary["active_days"],
+                    summary["first_timestamp"],
+                    summary["last_timestamp"],
+                    summary["top_sender"],
+                    json.dumps(summary["top_keywords"], ensure_ascii=False),
+                    json.dumps(summary["top_types"], ensure_ascii=False),
+                    json.dumps(summary["top_senders"], ensure_ascii=False),
+                ),
+            )
+            stats["summary_chats"] += 1
+            for item in summary["top_keywords"]:
+                conn.execute(
+                    """
+                    INSERT INTO keyword_index(chat_key, term, count, sample)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (key, item["term"], item["count"], item.get("sample", "")),
+                )
+                stats["keyword_rows"] += 1
 
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('last_indexed_at', ?)",
@@ -574,17 +676,23 @@ def rebuild_index(export_dir: str = EXPORT_DIR) -> dict:
             "INSERT OR REPLACE INTO meta(key, value) VALUES('message_count', ?)",
             (str(stats["messages"]),),
         )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('summary_chat_count', ?)",
+            (str(stats["summary_chats"]),),
+        )
         conn.commit()
 
     stats["elapsed_seconds"] = round(time.time() - started, 2)
     _update_settings(
         last_indexed_at=_now_text(),
         last_backup_summary=(
-            f"索引 {stats['messages']} 条消息，{stats['files']} 个会话文件"
+            f"索引 {stats['messages']} 条消息，{stats['files']} 个会话文件，"
+            f"生成 {stats['summary_chats']} 个会话摘要"
         ),
     )
     _append_log(
-        f"index rebuilt: {stats['messages']} messages from {stats['files']} files"
+        f"index rebuilt: {stats['messages']} messages from {stats['files']} files; "
+        f"{stats['summary_chats']} chat summaries; {stats['keyword_rows']} keywords"
     )
     return stats
 
@@ -613,6 +721,158 @@ def _row_to_result(row: sqlite3.Row) -> dict:
         "content": content,
         "source_file": row["source_file"],
     }
+
+
+def _fetch_related_context(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    limit_each_side: int = 2,
+) -> list[dict]:
+    timestamp = row["timestamp"]
+    username = row["username"]
+    local_id = row["local_id"] if row["local_id"] is not None else -1
+    if timestamp is None:
+        return []
+
+    before_rows = conn.execute(
+        """
+        SELECT id, datetime, sender, type, content
+        FROM messages
+        WHERE username = ?
+          AND timestamp IS NOT NULL
+          AND (
+            timestamp < ?
+            OR (timestamp = ? AND COALESCE(local_id, -1) < ?)
+          )
+        ORDER BY timestamp DESC, COALESCE(local_id, -1) DESC
+        LIMIT ?
+        """,
+        (username, timestamp, timestamp, local_id, limit_each_side),
+    ).fetchall()
+    after_rows = conn.execute(
+        """
+        SELECT id, datetime, sender, type, content
+        FROM messages
+        WHERE username = ?
+          AND timestamp IS NOT NULL
+          AND (
+            timestamp > ?
+            OR (timestamp = ? AND COALESCE(local_id, -1) > ?)
+          )
+        ORDER BY timestamp ASC, COALESCE(local_id, -1) ASC
+        LIMIT ?
+        """,
+        (username, timestamp, timestamp, local_id, limit_each_side),
+    ).fetchall()
+
+    items = list(reversed(before_rows)) + list(after_rows)
+    return [
+        {
+            "id": item["id"],
+            "datetime": item["datetime"] or "",
+            "sender": item["sender"] or "",
+            "type": item["type"] or "",
+            "content": short_snippet(item["content"] or "", 180),
+        }
+        for item in items
+    ]
+
+
+def _fetch_chat_summary(conn: sqlite3.Connection, username: str, chat: str) -> dict | None:
+    key = chat_identity(username, chat)
+    row = conn.execute(
+        "SELECT * FROM chat_summaries WHERE chat_key = ?",
+        (key,),
+    ).fetchone()
+    if not row:
+        return None
+    summary = dict(row)
+    summary["top_keywords"] = decode_json_list(summary.pop("top_keywords_json", "[]"))
+    summary["top_types"] = decode_json_list(summary.pop("top_types_json", "[]"))
+    summary["top_senders"] = decode_json_list(summary.pop("top_senders_json", "[]"))
+    return summary
+
+
+def _fetch_keyword_matches(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    limit: int = KNOWLEDGE_NEIGHBOR_LIMIT,
+) -> list[dict]:
+    terms = related_query_terms(query, limit=4)
+    if not terms:
+        return []
+    seen: set[tuple[str, str]] = set()
+    rows: list[dict] = []
+    for term in terms:
+        for row in conn.execute(
+            """
+            SELECT k.chat_key, k.term, k.count, k.sample, s.chat, s.username
+            FROM keyword_index k
+            JOIN chat_summaries s ON s.chat_key = k.chat_key
+            WHERE k.term LIKE ?
+            ORDER BY k.count DESC, s.last_timestamp DESC
+            LIMIT ?
+            """,
+            (f"%{term}%", limit),
+        ).fetchall():
+            pair = (row["chat_key"], row["term"])
+            if pair in seen:
+                continue
+            seen.add(pair)
+            rows.append(
+                {
+                    "chat": row["chat"] or row["username"] or "",
+                    "username": row["username"] or "",
+                    "term": row["term"] or "",
+                    "count": int(row["count"] or 0),
+                    "sample": row["sample"] or "",
+                }
+            )
+            if len(rows) >= limit:
+                return rows
+    return rows
+
+
+def _related_chats_from_items(
+    conn: sqlite3.Connection,
+    items: list[dict],
+    *,
+    limit: int = KNOWLEDGE_NEIGHBOR_LIMIT,
+) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    for item in items:
+        key = chat_identity(item.get("username", ""), item.get("chat", ""))
+        entry = grouped.get(key)
+        if entry is None:
+            summary = _fetch_chat_summary(conn, item.get("username", ""), item.get("chat", ""))
+            entry = {
+                "chat": item.get("chat") or item.get("username") or "",
+                "username": item.get("username") or "",
+                "hits": 0,
+                "latest_datetime": item.get("datetime") or "",
+                "latest_snippet": short_snippet(item.get("content") or "", 120),
+                "top_keywords": [],
+            }
+            if summary:
+                entry["top_keywords"] = [
+                    keyword.get("term", "")
+                    for keyword in (summary.get("top_keywords") or [])[:5]
+                    if keyword.get("term")
+                ]
+            grouped[key] = entry
+        entry["hits"] += 1
+        if item.get("datetime") and item.get("datetime") > entry["latest_datetime"]:
+            entry["latest_datetime"] = item.get("datetime") or ""
+            entry["latest_snippet"] = short_snippet(item.get("content") or "", 120)
+
+    ordered = sorted(
+        grouped.values(),
+        key=lambda value: (-value["hits"], value["latest_datetime"]),
+        reverse=False,
+    )
+    return ordered[:limit]
 
 
 def search_index(
@@ -723,12 +983,46 @@ def search_index(
 
         if not used_fts:
             items, total = like_search(conn)
+        for item in items:
+            row = conn.execute(
+                "SELECT * FROM messages WHERE id = ?",
+                (item["id"],),
+            ).fetchone()
+            if row:
+                item["context"] = _fetch_related_context(conn, row)
+                item["chat_summary"] = _fetch_chat_summary(
+                    conn,
+                    item.get("username", ""),
+                    item.get("chat", ""),
+                )
+            else:
+                item["context"] = []
+                item["chat_summary"] = None
+        related = _related_chats_from_items(conn, items)
+        if query and len(related) < KNOWLEDGE_NEIGHBOR_LIMIT:
+            fallback = _fetch_keyword_matches(
+                conn,
+                query,
+                limit=KNOWLEDGE_NEIGHBOR_LIMIT - len(related),
+            )
+            existing = {
+                (item.get("username", ""), item.get("chat", ""), item.get("term", ""))
+                for item in related
+            }
+            for item in fallback:
+                marker = (item.get("username", ""), item.get("chat", ""), item.get("term", ""))
+                if marker in existing:
+                    continue
+                related.append(item)
+                if len(related) >= KNOWLEDGE_NEIGHBOR_LIMIT:
+                    break
     return {
         "items": items,
         "total": total,
         "limit": limit,
         "offset": offset,
         "engine": "fts5" if used_fts else "like",
+        "related_chats": related,
     }
 
 
@@ -738,6 +1032,7 @@ def _index_stats() -> dict:
             "exists": False,
             "message_count": 0,
             "chat_count": 0,
+            "summary_chat_count": 0,
             "last_indexed_at": "",
             "fts_tokenizer": "",
         }
@@ -756,11 +1051,18 @@ def _index_stats() -> dict:
                 "exists": True,
                 "message_count": int(msg_row["n"] if msg_row else 0),
                 "chat_count": int(chat_row["n"] if chat_row else 0),
+                "summary_chat_count": int(meta.get("summary_chat_count", "0") or 0),
                 "last_indexed_at": meta.get("last_indexed_at", ""),
                 "fts_tokenizer": meta.get("fts_tokenizer", ""),
             }
     except sqlite3.Error as e:
-        return {"exists": False, "message_count": 0, "chat_count": 0, "error": str(e)}
+        return {
+            "exists": False,
+            "message_count": 0,
+            "chat_count": 0,
+            "summary_chat_count": 0,
+            "error": str(e),
+        }
 
 
 def _latest_logs(max_lines: int = 160) -> str:

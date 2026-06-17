@@ -63,12 +63,14 @@ class BackupSearchDesktop(tk.Tk):
         metrics.grid(row=0, column=1, rowspan=2, sticky="e")
         self.msg_count_var = tk.StringVar(value="0")
         self.chat_count_var = tk.StringVar(value="0")
+        self.summary_count_var = tk.StringVar(value="0")
         self.job_var = tk.StringVar(value="空闲")
         self.engine_var = tk.StringVar(value="-")
         self._metric(metrics, "已索引消息", self.msg_count_var, 0)
         self._metric(metrics, "会话数量", self.chat_count_var, 1)
-        self._metric(metrics, "当前任务", self.job_var, 2)
-        self._metric(metrics, "搜索引擎", self.engine_var, 3)
+        self._metric(metrics, "会话摘要", self.summary_count_var, 2)
+        self._metric(metrics, "当前任务", self.job_var, 3)
+        self._metric(metrics, "搜索引擎", self.engine_var, 4)
 
         controls = ttk.Frame(self, style="Card.TFrame", padding=16)
         controls.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
@@ -141,6 +143,17 @@ class BackupSearchDesktop(tk.Tk):
         self.detail_text = tk.Text(detail_frame, height=8, wrap="word", bg="#fffef8", relief="flat")
         self.detail_text.grid(row=1, column=0, sticky="nsew", pady=(5, 0))
 
+        insight_frame = ttk.Frame(search_card, style="Card.TFrame")
+        insight_frame.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
+        insight_frame.columnconfigure(0, weight=1)
+        insight_frame.columnconfigure(1, weight=1)
+        ttk.Label(insight_frame, text="会话摘要", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(insight_frame, text="相关会话 / 关键词", style="Card.TLabel").grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self.summary_text = tk.Text(insight_frame, height=11, wrap="word", bg="#fffef8", relief="flat")
+        self.summary_text.grid(row=1, column=0, sticky="nsew", pady=(5, 0), padx=(0, 6))
+        self.related_text = tk.Text(insight_frame, height=11, wrap="word", bg="#fffef8", relief="flat")
+        self.related_text.grid(row=1, column=1, sticky="nsew", pady=(5, 0), padx=(6, 0))
+
         log_card = ttk.Frame(body, style="Card.TFrame", padding=16)
         body.add(log_card, weight=1)
         log_card.columnconfigure(0, weight=1)
@@ -201,6 +214,7 @@ class BackupSearchDesktop(tk.Tk):
         settings = status["settings"]
         self.msg_count_var.set(str(idx.get("message_count", 0)))
         self.chat_count_var.set(str(idx.get("chat_count", 0)))
+        self.summary_count_var.set(str(idx.get("summary_chat_count", 0)))
         self.engine_var.set(idx.get("fts_tokenizer") or "LIKE")
         self.job_var.set(job.get("step") if job.get("running") else ("失败" if job.get("ok") is False else "空闲"))
         running = bool(job.get("running"))
@@ -288,6 +302,21 @@ class BackupSearchDesktop(tk.Tk):
             )
         self.detail_text.delete("1.0", "end")
         self.detail_text.insert("1.0", f"找到 {result.get('total', 0)} 条，显示 {len(self._result_items)} 条。")
+        self.summary_text.delete("1.0", "end")
+        self.summary_text.insert("1.0", "选择一条消息查看会话摘要和前后文。")
+        self.related_text.delete("1.0", "end")
+        related = result.get("related_chats") or []
+        if related:
+            lines = []
+            for item in related[:12]:
+                lines.append(
+                    f"{item.get('chat') or item.get('username') or ''}\n"
+                    f"关键词：{item.get('term', '')}  命中：{item.get('count', 0)}\n"
+                    f"{item.get('sample', '')}"
+                )
+            self.related_text.insert("1.0", "\n\n".join(lines))
+        else:
+            self.related_text.insert("1.0", "暂无相关会话关键词。")
 
     def _show_selected_result(self, _event=None):
         sel = self.tree.selection()
@@ -307,6 +336,46 @@ class BackupSearchDesktop(tk.Tk):
         )
         self.detail_text.delete("1.0", "end")
         self.detail_text.insert("1.0", text)
+        summary = item.get("chat_summary") or {}
+        keywords = summary.get("top_keywords") or []
+        top_senders = summary.get("top_senders") or []
+        top_types = summary.get("top_types") or []
+        context = item.get("context") or []
+        summary_lines = [
+            f"消息总数：{summary.get('message_count', 0)}",
+            f"文本消息：{summary.get('text_message_count', 0)}",
+            f"活跃天数：{summary.get('active_days', 0)}",
+            f"参与者：{summary.get('participant_count', 0)}",
+        ]
+        if summary.get("top_sender"):
+            summary_lines.append(f"最活跃发送者：{summary.get('top_sender')}")
+        if keywords:
+            summary_lines.append(
+                "高频关键词：" + " / ".join(
+                    f"{entry.get('term')}({entry.get('count')})" for entry in keywords[:8]
+                )
+            )
+        if top_senders:
+            summary_lines.append(
+                "发送者分布：" + " / ".join(
+                    f"{entry.get('sender')}({entry.get('count')})" for entry in top_senders[:6]
+                )
+            )
+        if top_types:
+            summary_lines.append(
+                "消息类型：" + " / ".join(
+                    f"{entry.get('type')}({entry.get('count')})" for entry in top_types[:6]
+                )
+            )
+        if context:
+            summary_lines.append("")
+            summary_lines.append("前后文：")
+            for ctx in context:
+                summary_lines.append(
+                    f"{ctx.get('datetime', '')} {ctx.get('sender', '')} [{ctx.get('type', '')}] {ctx.get('content', '')}"
+                )
+        self.summary_text.delete("1.0", "end")
+        self.summary_text.insert("1.0", "\n".join(summary_lines) if summary_lines else "暂无会话摘要。")
 
 
 def main():
