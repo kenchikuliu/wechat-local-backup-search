@@ -12,6 +12,7 @@ import traceback
 SCRIPT_ENTRYPOINTS = {
     "backup_search_desktop.py",
     "backup_search_app.py",
+    "backup_search_agent.py",
     "main.py",
     "decrypt_3x_db.py",
     "decrypt_db.py",
@@ -52,6 +53,8 @@ def _resolve(argv):
     cmd = argv[0]
     if cmd in {"backup-search", "backup", "search-app", "desktop"}:
         return "backup_search_desktop.py", argv[1:]
+    if cmd in {"agent", "background-agent", "daemon"}:
+        return "backup_search_agent.py", argv[1:]
     if cmd == "web":
         return "backup_search_app.py", argv[1:]
     if cmd in {"decrypt", "export", "status", "-s"}:
@@ -75,6 +78,7 @@ def print_usage():
         "\n"
         "  WeChatBackupSearch.exe                  启动桌面备份搜索软件\n"
         "  WeChatBackupSearch.exe backup-search    启动桌面备份搜索软件\n"
+        "  WeChatBackupSearch.exe agent            启动后台自动同步代理\n"
         "  WeChatBackupSearch.exe web              启动备用浏览器界面\n"
         "  WeChatBackupSearch.exe status           查看状态\n"
         "  WeChatBackupSearch.exe check-wechat     只检测微信进程\n"

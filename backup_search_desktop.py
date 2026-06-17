@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import queue
+import subprocess
+import sys
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -66,15 +68,17 @@ class BackupSearchDesktop(tk.Tk):
         self.summary_count_var = tk.StringVar(value="0")
         self.job_var = tk.StringVar(value="空闲")
         self.engine_var = tk.StringVar(value="-")
+        self.agent_var = tk.StringVar(value="未启动")
         self._metric(metrics, "已索引消息", self.msg_count_var, 0)
         self._metric(metrics, "会话数量", self.chat_count_var, 1)
         self._metric(metrics, "会话摘要", self.summary_count_var, 2)
         self._metric(metrics, "当前任务", self.job_var, 3)
         self._metric(metrics, "搜索引擎", self.engine_var, 4)
+        self._metric(metrics, "后台同步", self.agent_var, 5)
 
         controls = ttk.Frame(self, style="Card.TFrame", padding=16)
         controls.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
-        controls.columnconfigure(8, weight=1)
+        controls.columnconfigure(10, weight=1)
         self.backup_btn = ttk.Button(controls, text="立即备份", style="Accent.TButton", command=self._start_backup)
         self.backup_btn.grid(row=0, column=0, padx=(0, 8))
         self.index_btn = ttk.Button(controls, text="只重建索引", command=self._start_index)
@@ -88,8 +92,11 @@ class BackupSearchDesktop(tk.Tk):
         self.tx_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(controls, text="备份时转录语音", variable=self.tx_var).grid(row=0, column=6, padx=(0, 10))
         ttk.Button(controls, text="保存设置", command=self._save_settings).grid(row=0, column=7, padx=(0, 10))
+        self.agent_btn = ttk.Button(controls, text="启动后台同步", command=self._toggle_agent)
+        self.agent_btn.grid(row=0, column=8, padx=(0, 10))
+        ttk.Button(controls, text="刷新状态", command=self._refresh_status).grid(row=0, column=9, padx=(0, 10))
         self.last_info_var = tk.StringVar(value="正在读取状态...")
-        ttk.Label(controls, textvariable=self.last_info_var).grid(row=1, column=0, columnspan=9, sticky="w", pady=(10, 0))
+        ttk.Label(controls, textvariable=self.last_info_var).grid(row=1, column=0, columnspan=11, sticky="w", pady=(10, 0))
 
         body = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         body.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
@@ -216,17 +223,25 @@ class BackupSearchDesktop(tk.Tk):
         idx = status["index"]
         job = status["job"]
         settings = status["settings"]
+        agent = status.get("background_agent") or {}
         self.msg_count_var.set(str(idx.get("message_count", 0)))
         self.chat_count_var.set(str(idx.get("chat_count", 0)))
         self.summary_count_var.set(str(idx.get("summary_chat_count", 0)))
         self.engine_var.set(idx.get("fts_tokenizer") or "LIKE")
         self.job_var.set(job.get("step") if job.get("running") else ("失败" if job.get("ok") is False else "空闲"))
+        running_agent = bool(agent.get("running"))
+        self.agent_var.set("运行中" if running_agent else "未启动")
+        self.agent_btn.configure(text="停止后台同步" if running_agent else "启动后台同步")
         running = bool(job.get("running"))
         self.backup_btn.configure(state="disabled" if running else "normal")
         self.index_btn.configure(state="disabled" if running else "normal")
         last = settings.get("last_backup_at") or "从未备份"
         indexed = settings.get("last_indexed_at") or idx.get("last_indexed_at") or "从未索引"
+        agent_msg = ""
+        if running_agent:
+            agent_msg = f"；后台同步 PID：{agent.get('pid', '')}"
         msg = job.get("message") or settings.get("last_error") or settings.get("last_backup_summary") or ""
+        msg = (msg or "") + agent_msg
         self.last_info_var.set(f"上次备份：{last}；上次索引：{indexed}；{msg}")
 
     def _refresh_logs(self):
@@ -249,6 +264,46 @@ class BackupSearchDesktop(tk.Tk):
         )
         self._refresh_status()
         messagebox.showinfo("设置已保存", "自动备份设置已保存")
+
+    def _toggle_agent(self):
+        status = core.app_status()
+        agent = status.get("background_agent") or {}
+        if agent.get("running"):
+            self._stop_agent(agent)
+        else:
+            self._start_agent()
+
+    def _start_agent(self):
+        exe = sys.executable if getattr(sys, "frozen", False) else None
+        if exe and exe.lower().endswith(".exe"):
+            subprocess.Popen([exe, "agent"], cwd=core.APP_DIR)
+        else:
+            subprocess.Popen(
+                [sys.executable, core.os.path.join(core.SCRIPT_DIR, "backup_search_agent.py")],
+                cwd=core.APP_DIR,
+            )
+        self.after(1500, self._refresh_status)
+
+    def _stop_agent(self, agent: dict):
+        pid = int(agent.get("pid") or 0)
+        if pid <= 0:
+            return
+        try:
+            if core.os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/F", "/T"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=15,
+                )
+            else:
+                core.os.kill(pid, 15)
+        except Exception as exc:
+            messagebox.showerror("停止失败", f"无法停止后台同步：{exc}")
+            return
+        self.after(1500, self._refresh_status)
 
     def _start_backup(self):
         if core.job_state.get("running"):

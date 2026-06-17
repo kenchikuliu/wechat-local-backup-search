@@ -29,6 +29,7 @@ import time
 import traceback
 import urllib.parse
 import webbrowser
+import atexit
 from contextlib import closing
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -90,6 +91,8 @@ EXPORT_DIR = os.path.join(DATA_DIR, "exported_chats")
 INDEX_DB = os.path.join(DATA_DIR, "search_index.sqlite3")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 LOG_FILE = os.path.join(DATA_DIR, "backup.log")
+TASK_LOCK_FILE = os.path.join(DATA_DIR, "task.lock")
+BACKGROUND_STATE_FILE = os.path.join(DATA_DIR, "background_agent_state.json")
 KNOWLEDGE_NEIGHBOR_LIMIT = 6
 
 MIN_INTERVAL_MINUTES = 1
@@ -137,6 +140,7 @@ job_state = {
     "message": "",
 }
 scheduler_stop = threading.Event()
+task_lock_handle = None
 
 
 def _now_text() -> str:
@@ -153,6 +157,119 @@ def _append_log(line: str) -> None:
     stamp = _now_text()
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{stamp}] {line.rstrip()}\n")
+
+
+def _write_json_file(path: str, payload: dict) -> None:
+    _ensure_dirs()
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _read_json_file(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_background_state(**updates) -> dict:
+    state = _read_json_file(BACKGROUND_STATE_FILE)
+    state.update(updates)
+    state.setdefault("updated_at", _now_text())
+    state["updated_at"] = _now_text()
+    _write_json_file(BACKGROUND_STATE_FILE, state)
+    return state
+
+
+def _background_state() -> dict:
+    state = _read_json_file(BACKGROUND_STATE_FILE)
+    pid = int(state.get("pid") or 0)
+    running = False
+    if pid > 0:
+        try:
+            if os.name == "nt":
+                running = True if subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=10,
+                ).stdout.find(str(pid)) >= 0 else False
+            else:
+                os.kill(pid, 0)
+                running = True
+        except Exception:
+            running = False
+    if pid > 0 and not running:
+        state["running"] = False
+        try:
+            os.remove(BACKGROUND_STATE_FILE)
+        except OSError:
+            pass
+        return {}
+    state["running"] = running
+    return state
+
+
+def _clear_background_state() -> None:
+    if os.path.exists(BACKGROUND_STATE_FILE):
+        try:
+            os.remove(BACKGROUND_STATE_FILE)
+        except OSError:
+            pass
+
+
+def _release_task_lock() -> None:
+    global task_lock_handle
+    handle = task_lock_handle
+    task_lock_handle = None
+    if handle is None:
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+    try:
+        handle.close()
+    except OSError:
+        pass
+
+
+def _acquire_task_lock() -> bool:
+    global task_lock_handle
+    if task_lock_handle is not None:
+        return True
+    _ensure_dirs()
+    handle = open(TASK_LOCK_FILE, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return False
+    task_lock_handle = handle
+    return True
+
+
+atexit.register(_release_task_lock)
 
 
 def _load_settings() -> dict:
@@ -1079,6 +1196,9 @@ def _latest_logs(max_lines: int = 160) -> str:
 def run_backup(manual: bool = False) -> dict:
     if not job_lock.acquire(blocking=False):
         return {"started": False, "error": "已有备份或索引任务正在运行"}
+    if not _acquire_task_lock():
+        job_lock.release()
+        return {"started": False, "error": "已有其他进程正在备份或重建索引"}
     try:
         settings = _load_settings()
         _set_job(
@@ -1143,12 +1263,16 @@ def run_backup(manual: bool = False) -> dict:
         )
         return {"started": True, "ok": False, "error": err}
     finally:
+        _release_task_lock()
         job_lock.release()
 
 
 def run_index_only() -> dict:
     if not job_lock.acquire(blocking=False):
         return {"started": False, "error": "已有备份或索引任务正在运行"}
+    if not _acquire_task_lock():
+        job_lock.release()
+        return {"started": False, "error": "已有其他进程正在备份或重建索引"}
     try:
         _set_job(
             running=True,
@@ -1182,6 +1306,7 @@ def run_index_only() -> dict:
         )
         return {"started": True, "ok": False, "error": err}
     finally:
+        _release_task_lock()
         job_lock.release()
 
 
@@ -1239,6 +1364,7 @@ def app_status() -> dict:
             "index_db": INDEX_DB,
             "log_file": LOG_FILE,
         },
+        "background_agent": _background_state(),
         "server": {"host": HOST, "port": PORT},
         "time": _now_text(),
     }

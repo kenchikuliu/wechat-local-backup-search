@@ -6,6 +6,7 @@ sys.setrecursionlimit(sys.getrecursionlimit() * 5)
 datas = [
     ('backup_search_desktop.py', '.'),
     ('backup_search_app.py', '.'),
+    ('backup_search_agent.py', '.'),
     ('backup_search_knowledge.py', '.'),
     ('main.py', '.'),
     ('config.py', '.'),
