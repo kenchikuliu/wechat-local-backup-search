@@ -1,3 +1,32 @@
+# WeChat Local Backup Search
+
+> Windows 本地微信备份 + 快速搜索桌面软件
+
+这个仓库当前除了原始的微信数据库解密能力，还包含一个面向最终客户的本地产品：
+
+- 自动增量备份微信聊天记录
+- 本地全文搜索
+- 命中消息前后文查看
+- 会话摘要 / 高频关键词 / 相关会话
+- Windows 桌面版 `exe`
+
+桌面版说明见：
+[BACKUP_SEARCH_APP.md](./BACKUP_SEARCH_APP.md)
+
+直接运行桌面版源码：
+
+```powershell
+python backup_search_desktop.py
+```
+
+直接运行打包后的程序：
+
+```powershell
+dist\WeChatBackupSearch.exe
+```
+
+---
+
 # WeChat 4.x Database Decryptor
 
 > 💬 **交流群 / 防失联**: [Telegram - t.me/wechat_decrypt](https://t.me/wechat_decrypt)

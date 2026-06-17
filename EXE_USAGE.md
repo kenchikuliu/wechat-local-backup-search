@@ -1,3 +1,68 @@
+# WeChatBackupSearch 使用说明
+
+## 面向客户的桌面版
+
+如果你的目标是：
+
+- 备份自己的微信聊天记录
+- 以后在本地电脑里快速搜索
+- 不想通过浏览器打开
+
+请直接使用：
+
+```powershell
+.\WeChatBackupSearch.exe
+```
+
+它会打开一个桌面窗口 `微信本地备份搜索`，不是网页。
+
+## 桌面版使用流程
+
+1. 启动微信并保持登录
+2. 双击 `WeChatBackupSearch.exe`
+3. 点击“立即备份”
+4. 等待备份和索引完成
+5. 在搜索框输入关键词
+6. 查看命中消息、前后文、会话摘要和相关会话
+7. 如需长期运行，开启“自动备份”
+
+## 当前桌面版能力
+
+- 增量解密微信数据库
+- 增量导出聊天记录
+- 本地 SQLite 搜索索引
+- 联系人 / 群名过滤
+- 日期范围过滤
+- 命中消息前后文
+- 会话摘要
+- 高频关键词
+- 相关会话
+
+## 数据目录
+
+数据不打进 exe，本机会单独保存：
+
+```text
+backup_search_data/
+```
+
+主要内容：
+
+```text
+backup_search_data/
+  decrypted_3x/
+  exported_chats/
+  search_index.sqlite3
+  settings.json
+  backup.log
+```
+
+## 旧版 Web UI / CLI
+
+下面这些说明仍然适用于仓库里的原始工具链，但它们不是这次客户交付的主入口。
+
+---
+
 # WeChatDecrypt 使用说明 (Web UI + CLI 双模式)
 
 ## 快速开始
