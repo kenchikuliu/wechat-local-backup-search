@@ -1,0 +1,7 @@
+interface:
+  display_name: "WeChat Local Backup Search"
+  short_description: "Operate and extend the local WeChat backup-search desktop app."
+  default_prompt: "Use $wechat-local-backup-search to build, verify, package, or troubleshoot the local WeChat backup-search app."
+
+policy:
+  allow_implicit_invocation: true
